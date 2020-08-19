@@ -1,0 +1,110 @@
+---
+title: "Explore Properties"
+output: md_document
+---
+
+## Central London Properties
+
+```{r setup, include=FALSE}
+options(width = 150)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dpi=300)
+library(tidyverse)
+library(ggplot2)
+library(kableExtra)
+```
+
+After getting data from one of the popular UK property listing websites, I am going to look at the stock of residential homes in Central London. I define central London to be postcodes EC1, EC2, EC3, EC4, WC1 and WC2. Lets load in some data.
+
+```{r}
+#system("cd ~/Documents/ds/propertydata/data/pre_processing && pre_process.R")
+properties <- read_csv("~/Documents/ds/propertydata/data/pre_processing/data/properties.csv")
+```
+
+We have found `r length(unique(properties$property_id))` properties across `r length(unique(properties$postalCode))` postcodes. These include all properties regardless if they have been sold or not.
+
+See below a random sample of 5 properties
+
+```{r}
+sample_n(properties,1) %>% data.frame() %>% as.list()
+```
+
+
+### Missing data
+
+Percent of data missing by column.
+
+```{r results='asis'}
+missing_info <- map_dbl(properties, function(x) mean(is.na(x)) %>% round(2))
+kable(data.frame(missing_info))
+```
+
+We are missing basic information in `amenities` for around *`r scales::percent(missing_info['amenities'])`* of the data. This is because sometimes land registry does not have this data if the property has never been sold or is very old. 
+
+We are also missing description (and features), floorplan etc of most of the properties since we only retain that information from sales and rent listings. We will see later that a very small % of stock is actually resold each year. 
+
+Finally, the current value estimate as determined by the website is unavailable for *`r scales::percent(missing_info['zest'])`* of the houses. This probably makes sense since we do not even know the number of beds of a property for *`r scales::percent(missing_info['beds'])`* of the properties!
+
+
+### Property Characteristics
+
+What do the properties in this area look like ?
+
+```{r}
+properties <- properties %>% mutate(
+  beds = as.factor(as.numeric(as.character(beds)))
+  ) 
+
+properties %>% select(is_flat, is_leasehold, beds, area, zest) %>% summary
+```
+
+The property stock with estimates is worth a total of £`r scales::comma(sum(properties$zest/1e6,na.rm=T))`m. Since `r scales::percent(missing_info['zest'])` is missing, this would imply the whole stock to be £`r round(sum(properties$zest/1e6,na.rm=T)/(1-missing_info['zest']),0)`m.
+
+```{r}
+plotdf <- properties %>% filter(!is.na(beds)) %>% mutate(
+  beds = as.numeric(as.character(beds)),
+  beds = ifelse(beds > 3, "4+",beds),
+  beds = factor(beds, levels=c(0,1,2,3,"4+")),
+  area = ifelse(area > 3000, 3000, area)
+)
+```
+
+
+```{r fig.height=8}
+bar_df <- plotdf %>% mutate(post_first = str_extract(postalCode, "[A-Z]+\\d+"))  %>% group_by(beds, post_first) %>% count()
+p <- ggplot(bar_df, aes(beds, n)) + geom_col(fill="white", colour="black", alpha=0.3) + theme_minimal() + 
+  ggtitle("Number of properties by bedrooms") +
+  geom_text(aes(label=scales::comma(n,accuracy = 1)), vjust=1.3) +
+  theme(axis.text.y = element_blank()) + scale_y_continuous("") + facet_wrap("post_first")
+ggsave("property-beds.png",p, height=8, width=12)
+p
+```
+
+```{r}
+plot_summary <- group_by(plotdf, beds) %>% filter(!is.na(area)) %>% summarise(
+  mean = mean(area[area>50 & area < quantile(area, 0.99)]),
+  median = median(area),
+  `UQ` = quantile(area, 0.75),
+  `LQ` = quantile(area, 0.25)
+) %>% gather(metric, value, -beds) %>% mutate(label=paste(metric,scales::comma(value,accuracy = 1),"sq ft"))
+```
+
+
+```{r fig.height=15, fig.width=12}
+p2 <- ggplot(plotdf, aes(x=area, fill=beds)) + geom_density() + theme_minimal() + 
+  ggtitle("Internal area by the number of bedrooms") + 
+  scale_fill_brewer(type="qual",palette = "Set2") + scale_x_continuous(breaks=scales::pretty_breaks(n=10)) +
+  geom_vline(data=plot_summary, aes(xintercept=value), linetype='dotted') +
+  geom_text(data=plot_summary, aes(x=value, label=label, y=0), angle=90, size=4, hjust=0, vjust=0) +
+  facet_wrap("beds", ncol = 1,labeller = function(x) {
+    mutate(x, 
+           beds = ifelse(beds==0, "studio appartment", paste0(beds," bedroom property"))
+           )
+    }) +
+  theme(axis.text.y = element_blank(),strip.text = element_text(size=12,hjust = 0), legend.position = "none") + scale_y_continuous("")
+
+ggsave("property-area.png",p2, height=14, width=14)
+p2
+```
+As expected the distribution of the house area shifts to the right as number of bed rooms increases. It is also interesting that it becomes flatter, implying that the variablity of the properties within the 'bedrooms' increases as we add more bedrooms. Hence, the properties become more individual.
+
+
