@@ -1,0 +1,351 @@
+---
+title: "Listing analysis"
+output: md_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, rows.print=25, )
+library(tidyverse)
+library(stringr)
+library(ggplot2)
+library(glue)
+library(lubridate)
+library(furrr)
+library(kableExtra)
+```
+
+In this notebook, I will be looking at the number of properties listed for sale and sold over the years. I would expect that COVID-19 and work from home culture must have lead to many more listings this year. It would be interesting to see if these were followed by sales. I will do an analysis of rentals and lets separately. 
+
+The data for listing and sales comes from an online property listing. All listings are under a property id which is great for confirming repeat sales. However, sometimes there are extra listings within a listings. Eg. if there has been a price reduction or a re listing. I have cleaned up all this data and created a table for listings. See below
+
+```{r}
+# made from pre_processing/pre_process.R
+properties <- read_csv("~/Documents/ds/propertydata/data/pre_processing/data/properties.csv")
+listings <-read_csv("~/Documents/ds/propertydata/data/pre_processing/data/listings_df.csv")
+str(listings)
+```
+
+We have `r nrow(listings)` listings from `r length(unique(listings$property_id))` properties.
+
+Lets look at all the different types of listings we have, denoted by listing status.
+
+A listing status are 'tags' on the listing page. They tell us if a property has been sold/let. Alternatively we also get status updates from the property page. For e.g `Listedforsale` means that a property was historically listed and `Sold` means a property was sold according to land registry.
+
+```{r}
+table(listings$status %>% tolower) %>% sort
+```
+
+`info_type` is an interesting attribute. This is parsed from a listing page when we have the history of the *listing* itself.
+
+```{r}
+listings %>% 
+  mutate(info_type=case_when(
+    str_detect(info_type,"reduce") ~ "price reduction", 
+    str_detect(info_type, "Price increased") ~ "price increase", 
+    TRUE ~ info_type)) %>% 
+  pull(info_type) %>% tolower %>% table %>% sort
+```
+
+A property has multiple listings in our table. We could also have multiple entries in our table for the same "listing". Eg price changes, status changes. To analyse sales, we want to have a unique row per "real" status. The statuses we are interested in analysing are simply "For Sale" and "Sold". The first question we want to ask ourselves is
+
+Surprised to see price increases! Although they are 4x less common than a price reduction.
+
+**How many properties are sold per year in Central London ?**
+
+First of all we create a `clean_status` which ignores some statues and groups certain statuses. The code should explain what I am doing.
+
+```{r}
+prices_data_sum <- listings %>% 
+  # keep only residential listings
+  filter(is.na(listing_url) | (!str_detect(listing_url,"commercial"))  ) %>% 
+  
+  mutate(
+    # this is the information in the table that comes up on the website, for a listing
+    # it sometimes tell us previous listings of the property
+    info_type = ifelse(str_detect(info_type, "Price reduced"),"Price reduction",info_type),
+    info_type = ifelse(str_detect(info_type, "Price increased"),"Price increase",info_type),
+    # create factors, keeping the more importat levels first, since we will use this as the order to 
+    # de-duplicate
+    info_type = factor(str_replace_all(str_trim(info_type)," ","_") %>% tolower, 
+                       levels = c("price_reduction","price_increase","first_listed","last_sold","main_listing","previous_sale_prices")),
+    status_clean = case_when(
+      str_detect(tolower(status),"sold") ~ "Sold", # put under offer same as sold for reducing number of cats
+      info_type=="last_sold" ~ "Sold",
+      str_detect(tolower(status),"under offer") ~ "For Sale", # put under offer same as sold for reducing number of cats
+      str_detect(tolower(status),"let") ~ "Rented",
+      str_detect(tolower(status),"listedforsale") ~ "For Sale", # this is the 'archived' info on website, displaying when something was listed for sale historically
+      str_detect(listing_url,"to-rent") & status == "Listing expired" ~ "Rent Expired",
+      str_detect(listing_url,"for-sale") & status == "Listing expired" ~ "Sale Expired",
+      str_detect(listing_url,"to-rent") ~ "To Rent",
+      str_detect(listing_url,"for-sale") ~ "For Sale",
+      str_detect(price,"pcm") ~ "Rent NA", # price in pcm but no other status info..
+      str_detect(listing_url,"property-history")  ~ "For Sale" # if not status given, this url is the archived url template, and assume its for sale
+    ),
+    
+    status_clean = factor(status_clean, levels=c("Sold","For Sale","Rented","To Rent","Rent NA","Rent Expired","Sale Expired")),
+    
+    # clean prices
+    price_num = str_replace_all(price,"[£,]","") %>% str_extract("\\d+") %>% as.numeric,
+    
+    # clean dates
+    saledate_date = lubridate::ymd_hms(saledate) %>% as.Date,
+    saledate_date = as.Date(ifelse(is.na(saledate_date),ymd(saledate), saledate_date), origin='1970-01-01'),
+    
+    # get unique id / key for listing.
+    listing_key = ifelse(is.na(listing_id), paste0("p",property_id,year(saledate_date)), paste0("l",listing_id)),
+    listing_key = as.factor((as.character(listing_key))),
+  )
+
+prices_data_sum <- prices_data_sum %>% 
+  # remove missing saledates, approx 20% of the data is lost here because these are properties which have
+  # never been sold
+  filter(saledate != "None" & !is.na(saledate_date) & !is.na(price_num)) %>% 
+  left_join(properties %>% select(area, beds, property_id, zest, postalCode), by="property_id") %>% 
+  select(-saledate,-price,-listing_url) %>% arrange(saledate_date)
+
+print("Summary")
+summary(prices_data_sum %>% select(saledate_date, status_clean, price_num, info_type))
+```
+
+```{r}
+prices_data_sum %>% filter(property_id==29600092) %>% select(status, listing_id, property_id, info_type, status_clean, price_num, saledate_date, area, beds) %>% distinct %>% kable
+```
+As you can see we managed to find status updates for all but 15 listings. We also have prices for them. We find that our listing data ranges from 2000s - today.
+
+Lets look at some example properties and their histories
+
+```{r}
+t <- prices_data_sum %>% filter(property_id %in% 28362000) %>% 
+  arrange(year(saledate_date),month(saledate_date),status_clean)
+# only show distinct data based on property id, year-month of listing.
+distinct(t, property_id, status_clean, year(saledate_date), .keep_all = T) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date) %>% kable
+```
+You can see here that the property has been listed for sale, then rented, then for sale and sold twice after. This is a rich piece of history for a property and would be very useful for statistical / ML models.
+
+As you can see in the table above we have many duplicates. We remove them for sale analysis by ordering on `status_clean` such that we take the order `"Sold","For Sale","Rented","To Rent"` and then distinct property_id and year.
+
+```{r}
+library(lubridate)
+plotdf <- prices_data_sum %>% 
+  mutate(beds = as.numeric(as.character(beds)),
+         saleyear = year(saledate_date),
+         saledate=dmy(paste0("01-",
+                             #month(saledate_date),
+                             "01-",
+                             year(saledate_date)))
+         ) %>% 
+  filter(!is.na(status_clean)) %>% 
+  arrange(saledate_date,status_clean) %>% 
+  distinct(property_id, saledate, status_clean, .keep_all = T) %>% arrange(saledate_date)
+```
+
+Lets look at a few examples for different types of `clean_status`
+
+1. Random property `Sold` in 2020
+
+```{r}
+plotdf %>% filter(property_id %in% (plotdf %>% filter(year(saledate_date)==2020 & status_clean=="Sold") %>% sample_n(1) %>% pull(property_id))) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date) %>% kable
+```
+
+2. Random property `Rented` in 2020
+
+```{r}
+plotdf %>% filter(property_id %in% (plotdf %>% filter(year(saledate_date)==2020 & status_clean=="Rented") %>% sample_n(1) %>% pull(property_id))) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date) %>% kable
+```
+
+3. `Rent NA` meaning, that the listing is archived but we do not know if it was let or not. Although, we can probably assume that the property was let.
+
+```{r}
+plotdf %>% filter(property_id %in% (plotdf %>% filter(year(saledate_date)==2020 & status_clean=="Rent NA") %>% sample_n(1) %>% pull(property_id))) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date) %>% kable
+```
+
+
+4. Random property `To Rent` in 2020
+
+```{r}
+plotdf %>% filter(property_id %in% (plotdf %>% filter(year(saledate_date)==2020 & status_clean=="To Rent") %>% sample_n(1) %>% pull(property_id))) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date) %>% kable
+```
+
+5. Random property 'For Sale' in 2020
+
+```{r}
+plotdf %>% filter(property_id %in% (plotdf %>% filter(year(saledate_date)==2020 & status_clean=="For Sale") %>% sample_n(1) %>% pull(property_id))) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date) %>% kable
+```
+
+6. Listing expired
+
+If a listing is no longer live on the listing website, we mark it as `Listing Expired` it can either be a `Rent Expired` or a `Sale Expired` depending on if originally the listing was for rent or sale.
+
+```{r}
+plotdf %>% filter(property_id %in% (plotdf %>% filter(year(saledate_date)==2020 & status_clean=="Sale Expired") %>% sample_n(1) %>% pull(property_id))) %>% 
+  select(listing_id, property_id, info_type, status_clean, price_num, saledate_date)
+```
+
+After checking some old 'Sale Expired' listings it seems these are listings which never sold. Sometimes, the listing is even marked sold but the sale must have fallen through since there is nothing on land registry. We have `r sum(plotdf$status_clean=="Sale Expired")` expired sale listings.
+
+Rental listings are a bit more tricky because there is no Land Registry for rentals...
+
+## Properties for sale per year
+
+```{r}
+p <- plotdf %>% filter(saledate >= '2005-01-01' & beds < 4 & status_clean %in% c("Sold","For Sale")) %>% 
+  group_by(saledate, status_clean) %>% count() %>% 
+  ggplot(aes(saledate, n, fill=status_clean)) + 
+  geom_col(alpha=0.5) + #facet_wrap("beds") + 
+  theme_minimal() +
+  scale_fill_manual("",values=list("Sold"="grey80","For Sale"="sky blue","Rented"="orange")) +
+  theme(legend.position = "none", axis.title.y = element_blank(), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(), panel.grid = element_blank(), 
+        axis.text.y = element_blank(), 
+        strip.text = element_text(hjust=0, size=11,face = "bold")
+        ) + 
+  ggtitle("Number of property transactions per year",subtitle = "In postcodes EC1/2/3/4 and WC1/2") +
+  scale_x_date("",breaks=as.Date(paste0(2005:2020,"-01-01")), labels=year,position = "top") + 
+  geom_text(aes(label=n, vjust=1.2), size=3) +
+  facet_wrap("status_clean", ncol=1)
+
+ggsave("graphics/sales_per_year.svg",p,width=7, height=4)
+```
+
+# Properties rented per year
+
+Agents will remove rental listings without updating the status. There could be several reasons, including that the property has been successfully rented.
+
+See below the prior status of the properties where the rental listing expired. The majority of the properties were rented and then take off the website but some were taken off without an update on the listing status - they still say 'To Rent'.
+
+Unfortunately, we do not have historic data of 'fresh' rental listings. So our analysis of rentals per year will not be accurate going back. We will be under counting rentals historically since we do not include rentals which have been taken off without a status update.
+
+```{r}
+semi_join(plotdf,
+          plotdf %>% filter(status_clean=="Rent Expired") %>% select(listing_id)
+) %>% filter(status_clean !="Rent Expired" & info_type=="main_listing") %>% 
+  arrange(desc(saledate)) %>% filter(!duplicated(property_id)) %>% pull(status_clean) %>% table
+```
+
+Nevertheless, we can look at **confirmed** rentals historically.
+
+```{r}
+levels(plotdf$status_clean)
+```
+
+
+
+```{r}
+cpdf <- plotdf %>% 
+  #mutate(status_clean=ifelse(status_clean=="Rent NA","Rented",as.character(status_clean))) %>% 
+  filter(saledate >= '2010-01-01' & beds < 4 & status_clean %in% c("Rented","Rent NA","Rent Expired")) %>% 
+  #mutate(status_clean = factor(status_clean, levels=c("Rent Expired","Rented","Rent NA"))) %>% 
+  arrange(saledate_date, status_clean) %>% 
+  distinct(property_id,saledate,.keep_all = T) %>% 
+  group_by(saledate, status_clean) %>% count() %>% 
+  filter(status_clean != "Rent Expired") %>% 
+  mutate(status_clean=factor(status_clean,levels=rev(levels(status_clean))))
+
+sums <- cpdf %>% group_by(saledate) %>% summarise(n=sum(n)) %>% filter(saledate < '2020-01-01') %>% mutate(status_clean="Rented")
+
+p2 <- ggplot(cpdf, aes(saledate, n, fill=status_clean)) + 
+  geom_col(alpha=0.5) + #facet_wrap("beds") + 
+  theme_minimal() +
+  scale_fill_manual("",values=list("Rent Expired"="grey80","Rented"="orange", "Rent NA"=rgb(255/255, 227/255, 174/255))) +
+  theme(legend.position = "top", axis.title.y = element_blank(), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(), panel.grid = element_blank(), 
+        axis.text.y = element_blank(), 
+        strip.text = element_text(hjust=0, size=11,face = "bold")
+        ) + 
+  ggtitle("Number of properties let per year",subtitle = "In postcodes EC1/2/3/4 and WC1/2") +
+  scale_x_date("",breaks=as.Date(paste0(2010:2020,"-01-01")), labels=year,position = "top") +
+  geom_text(data=sums, aes(label=n), vjust = -1, size=3, color="grey20")
+
+ggsave("graphics/lettings_per_year.svg",p2,width=7, height=4)
+```
+
+
+# Rental Yields
+
+This is a very important metric for a property investor. Since we have both rental and sale prices for a property we can check gross rental yield.
+
+```{r}
+
+sale_prices <- prices_data_sum %>% 
+  filter(!str_detect(status_clean,"Rent")) %>% # get all non rental listings
+  select(sale_price=price_num, saledate=saledate_date, property_id, beds, postalCode, area) %>% 
+  arrange(saledate) %>% 
+  distinct %>% 
+  mutate(postalCode = str_extract(postalCode,"[A-Z]+\\d+"))
+
+# get all rentals
+rent_prices <- prices_data_sum %>% filter(str_detect(status_clean,"Rent")) %>% 
+  select(rent_price=price_num, saledate=saledate_date, property_id)
+
+# remove sales where we dont know
+sale_prices <- semi_join(sale_prices, rent_prices, by="property_id")
+
+sale_prices$saledate_rent <- Sys.Date()
+for(i in seq_along(sale_prices$saledate)) {
+  rent_prices_prop <- rent_prices %>% filter(property_id==sale_prices$property_id[i])
+  closest_rent_date <- which.min(rent_prices_prop$saledate-sale_prices$saledate[i])
+  sale_prices$saledate_rent[i] <- as.Date(rent_prices_prop$saledate[closest_rent_date], origin="1990-01-01")
+}
+
+rental_yields <- sale_prices %>% left_join(rent_prices, by=c("saledate_rent"="saledate", "property_id")) %>% 
+  mutate(date_diffs = abs(saledate-saledate_rent)) %>% filter(date_diffs<365*3) %>% 
+  mutate(
+    rental_yield = rent_price*12/sale_price,
+  postalCode=ifelse(postalCode %in% c("EC2","EC3","EC4"),"EC2.3.4", postalCode),
+  postalCode=ifelse(postalCode %in% c("WC2","WC1"),"WC1.2", postalCode)
+  )
+```
+
+
+```{r}
+
+prdf <- rental_yields %>% mutate(
+  year_d = year(saledate),
+  area = ifelse(area > 600*(beds+1), NA, area),
+  beds = ifelse(beds > 3,NA,beds),
+  area = ifelse(area > 2000, NA, area),
+  beds = ifelse(beds < 2,"studio/1",as.character(beds)),
+  
+) %>% #filter(postalCode==postcode) %>% 
+  mutate(beds = as.factor(beds)) %>% filter(between(rental_yield, 0.01,0.2) & !is.na(beds) & year_d > 2009)
+
+prdf_sum <- prdf %>% group_by(beds,year_d) %>% 
+  summarise(avg = mean(rental_yield), median=median(rental_yield), uq=quantile(rental_yield, 0.75), lq=quantile(rental_yield, 0.25)) %>% 
+  gather(indicator, rental_yield, -beds, -year_d) %>% mutate(
+    label = paste0(beds," bed ","", scales::percent(rental_yield,accuracy = 0.1)),
+    label2 = paste0(scales::percent(rental_yield,accuracy = 0.1)),
+    label = ifelse(year_d > 2010, label2, label)
+    )
+
+pr_colours <- list("0"="purple","studio/1"="navy","2"="dark green","3"="maroon")
+
+p <- ggplot(prdf, aes(rental_yield, colour=beds, fill=beds)) + geom_density(alpha=0.1, linetype="solid", size=0.1, adjust=1.5) + facet_wrap("year_d", ncol=1,scales = "free_y") +
+  geom_vline(data=prdf_sum %>% filter(indicator=="avg"), aes(xintercept=rental_yield, colour=beds), size=0.25, linetype="solid") +
+  geom_text(data=prdf_sum %>% filter(indicator=="avg"), aes(colour=beds, label=label, y=0), size=1.5, angle=90, vjust=0, hjust=0) +
+  scale_color_manual("",values=pr_colours) + 
+  scale_fill_manual("",values=pr_colours) + 
+  theme_minimal() + theme(panel.grid = element_blank(), axis.text = element_blank(), strip.text = element_text(hjust=0,size = 8), 
+                          legend.position = c(0.9,1), legend.text = element_text(size=6), legend.key.size = unit("0.3","cm"), legend.background = element_rect(colour="grey80", size=0.2, linetype="dotted"), legend.title = element_blank()) + scale_x_log10("") + ggtitle(glue("Rental yields each year by # of beds"),subtitle = "distributions, with lines showing average per bed") + scale_y_continuous("")
+
+
+ggsave(glue("graphics/rental_yields.svg"),p,height = 10, width=6) 
+```
+
+Trends in rental yields
+
+We have floor area for `r prdf %>% filter(!is.na(area)) %>% nrow` properties, so we can see correlation between rental yield and size of property.
+
+```{r}
+p4 <- ggplot(prdf %>% mutate(beds=factor(beds, levels=c("studio/1","2","3"))) , aes(area, rental_yield, colour=beds)) + geom_point(alpha=0.1) + facet_wrap("beds") + stat_smooth(method=lm) +
+  theme_minimal() + scale_y_log10("Annual rental yield",labels = scales::percent) + scale_x_continuous("Area in sq ft") + scale_color_brewer(type="qual", palette = "Set2") + 
+  theme(legend.position = "none", strip.text = element_text(size=11)) + ggtitle("Smaller properties provide higher rental yield", subtitle = "by bedrooms")
+ggsave(glue("graphics/rental_yield_area_cor.svg"),p4, height = 5, width=7)
+```
