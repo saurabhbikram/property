@@ -1,3 +1,4 @@
+setwd("~/property/analysis")
 library(leaflet)
 library(tidyverse)
 library(stringr)
@@ -6,10 +7,10 @@ library(glue)
 library(lubridate)
 library(furrr)
 library(kableExtra)
-aws.signature::use_credentials(profile="sb")
+#aws.signature::use_credentials(profile="sb")
 
-source('~/Documents/ds/propertydata/data/landregistry/price_paid_data.R')
-source('~/Documents/ds/property/analysis/clean_listings.R')
+source('~/propertydata/data/landregistry/price_paid_data.R')
+source('~/property/analysis/clean_listings.R')
 
 # made from pre_processing/pre_process.R
 listings <- aws.s3::s3readRDS("preprocess/EC1.rds","ukpd")
@@ -18,23 +19,32 @@ property_info_full <- create_property_info(clist)
 
 # get and match land registry sales 
 lr_sales <- get_lr_sales(unique(property_info_full$postcode))# %>% filter(category=="Standard price paid transaction")
-matched_lr_sales <- match_lr_sales(property_info_full, lr_sales)
+epc <- aws.s3::s3readRDS("epc_process/EC1.rds","ukpd")
+matched_lr_sales <- match_lr_sales(property_info_full, lr_sales, epc)
 
-summary(matched_lr_sales$match_type %>% as.factor)
+summary(matched_lr_sales$match_type %>% as.factor) %>% print
 
-t <- matched_lr_sales %>% filter(match_type == "approx_multi") %>% sample_n(1)
-t
-property_info_full %>% filter(property_key %in% unlist(t$property_key)) %>% 
-  select(property_key, address) %>% mutate(address = str_replace_all(address,", London.*","")) %>% distinct() %>% data.frame
+matched_lr_sales$epc_match_type[is.na(matched_lr_sales$epc_match_type)] <- "no match"
+summary(matched_lr_sales$epc_match_type %>% as.factor) %>% print
+
+#t <- matched_lr_sales %>% filter(match_type == "approx_multi") %>% sample_n(1)
+#t
+#property_info_full %>% filter(property_key %in% unlist(t$property_key)) %>% 
+#  select(property_key, address) %>% mutate(address = str_replace_all(address,", London.*","")) %>% distinct() %>% data.frame
 
 matched_lr_sales$raw_property_key <- matched_lr_sales$property_key
 
-w <- lr_sales_all$match_type %in% c("approx_regex","exact")
+w <- matched_lr_sales$match_type %in% c("approx_regex","exact")
 
-lr_sales_all$property_key <- NA
-lr_sales_all$property_key[w] <- map_chr(lr_sales_all$raw_property_key, function(x) if(!is.null(x)) if(length(x)==1) x[1] else NA else NA)[w]
+matched_lr_sales$property_key <- NA
+matched_lr_sales$property_key[w] <- map_chr(matched_lr_sales$raw_property_key, function(x) if(!is.null(x)) if(length(x)==1) x[1] else NA else NA)[w]
 
-summary(is.na(lr_sales_all$property_key))
+summary(is.na(matched_lr_sales$property_key))
+
+head(property_info_full)
+
+lr_sales_all <- select(matched_lr_sales, -raw_property_key) %>% 
+  left_join(epc %>% select(epc_id=property_id, area_sqm, energy_use, date_report), by="epc_id") %>% mutate(epc_are_sq_ft = round(10.7639*area_sqm,1))
 
 # add lat, lon, beds etc
 lr_sales_all2 <- left_join(lr_sales_all,
@@ -43,7 +53,7 @@ lr_sales_all2 <- left_join(lr_sales_all,
                              select(postcode, latitude, longitude), by="postcode") %>% 
                  left_join(property_info_full %>% 
                              select(property_key, beds, area, amenities) %>% 
-                             filter(!duplicated(property_key)), by="property_key") %>% select(-raw_property_key)
+                             filter(!duplicated(property_key)), by="property_key")
 
 # default prop, listing keys
 lr_sales_all2$property_key <- as.character(lr_sales_all2$property_key)
@@ -55,8 +65,18 @@ lr_sales_all2$longitude <- as.numeric(lr_sales_all2$longitude)
 lr_sales_all2$latitude <- as.numeric(lr_sales_all2$latitude)
 lr_sales_all2$trans_date <- as.Date(lr_sales_all2$trans_date)
 lr_sales_all2$price_num <- as.numeric(lr_sales_all2$price)
+lr_sales_all2$area <- ifelse(is.na(lr_sales_all2$area), lr_sales_all2$epc_are_sq_ft,lr_sales_all2$area)
 
-prices_data_sum <- clist %>% arrange(status_clean, desc(trans_date)) %>% 
+property_info_full <- property_info_full %>% left_join(lr_sales_all2 %>% 
+                                   select(property_key, energy_use, date_report, epc_are_sq_ft) %>% filter(!is.na(property_key)) %>% distinct, 
+                                 by="property_key")
+
+property_info_full$area <- ifelse(is.na(property_info_full$area), property_info_full$epc_are_sq_ft,property_info_full$area)
+property_info_full$epc_are_sq_ft <- NULL
+
+
+prices_data_sum <- clist %>% 
+  arrange(status_clean, desc(trans_date)) %>% 
   distinct(property_key, listing_key, year(trans_date),.keep_all = T) %>% 
   select(property_key, listing_key,trans_date, listing_url, price_num, status_clean) %>% 
   left_join(property_info_full %>% ungroup %>% select(-property_key), by="listing_key")
@@ -68,10 +88,11 @@ prices_data_sum <- bind_rows(prices_data_sum,
                              ) %>% 
   distinct(property_key, year(trans_date), price_num, status_clean, .keep_all = T)
 
+
 summary(prices_data_sum)
 
 POSTCODE <- "EC1"
-BEDS <- c(0,1)
+BEDS <- c(0,20)
 
 for_sale <- prices_data_sum %>% 
   filter(str_detect(postcode,POSTCODE) & ( between(beds,BEDS[1],BEDS[2]) | is.na(beds)) & status_clean == "For Sale" & trans_date > '2019-01-01') %>% 
@@ -90,7 +111,10 @@ already_sold <- inner_join(prices_data_sum %>%
 house_data <- anti_join(for_sale, already_sold)
 
 house_data <- prices_data_sum %>%
-  filter(str_detect(postcode,POSTCODE) & (between(beds,BEDS[1],BEDS[2]) | is.na(beds)) & status_clean == "Sold" & trans_date > '2019-01-01') %>%
+  filter(str_detect(postcode,POSTCODE) & 
+           (between(beds,BEDS[1],BEDS[2]) | is.na(beds)) & 
+           status_clean == "Sold" & 
+           trans_date > '2019-01-01') %>%
   arrange(desc(trans_date)) %>% filter(!duplicated(property_key))
 
 prop_history <- prices_data_sum %>% 
@@ -108,19 +132,20 @@ house_data <- left_join(house_data,
                         by="property_key"
 ) %>% 
   mutate(
-    listing_url_desc = ifelse(is.na(listing_url),"",glue("<a href = '{listing_url}'>Listing</a>")),
-    property_key_url = ifelse(str_detect( property_key,"^l"),"",glue("<a href = 'https://www.zoopla.co.uk/property/{property_key}'>Property {property_key}</a>"))
+    listing_url_desc = ifelse(is.na(listing_url),"",glue("</br><a href = '{listing_url}' target='_blank'>Listing</a>")),
+    property_key_url = ifelse(str_detect( property_key,"^l"),"",glue("</br><a href = 'https://www.zoopla.co.uk/property/{property_key}' target='_blank'>Property {property_key}</a>"))
     )
 
 ldata <- house_data %>% #filter(!is.na(area)) %>% 
   mutate(
   price_pretty=paste0(round(price_num/1000,0),"k"),
   bed_msg = ifelse(!is.na(beds),glue("{beds} beds"),""),
-  area_msg = ifelse(!is.na(beds),glue(" {area} sq ft</br>"),""),
-  msg = glue("{address}<p>{bed_msg}{area_msg}
-             {status_clean}, {format(trans_date,\"%b %Y\")}, £{price_pretty}
-             </br>{sale_hist}
-             </br>{listing_url_desc}{property_key_url}"),
+  area_msg = ifelse(!is.na(area),glue(" {area} sq ft"),""),
+  sale_hist = ifelse(is.na(sale_hist),"",paste0("</br>",sale_hist)),
+  msg = glue("{address}, {postcode}</br>{bed_msg}{area_msg}
+             </br>{status_clean}, {format(trans_date,\"%b %Y\")}, £{price_pretty}
+             {sale_hist}
+             {listing_url_desc} {property_key_url}"),
   scale_clor = scale(log(price_num))[,1],
   scale_clor = scales::rescale(scale_clor),
   bg_color = scales::colour_ramp(c("blue","red"))(scale_clor)
@@ -152,5 +177,5 @@ p <- leaflet(ldata3) %>% addTiles() %>% addCircleMarkers(lng = ~longitude,lat = 
                                                         labelOptions = labelOptions(noHide = T, textsize = "12px",direction = "bottom"))
 
 library(htmlwidgets)
-saveWidget(p, file="ec1.html")
+saveWidget(p, file="ec1m.html")
 

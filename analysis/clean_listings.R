@@ -4,8 +4,8 @@ clean_listings <- function (listings){
 
   listings %>% mutate(
     listing_id = ifelse(is.na(listing_id), str_extract(listing_url,"\\d+$"),listing_id),
-    property_key = ifelse(is.na(property_id),paste0("l",listing_id), property_id) %>% as.factor,
-    listing_key = ifelse(is.na(listing_id),paste0("p",property_id), listing_id) %>% as.factor,
+    property_key = ifelse(is.na(property_id),paste0("l",listing_id), property_id) %>% as.character(),
+    listing_key = ifelse(is.na(listing_id),paste0("p",property_id), listing_id) %>% as.character,
     # transaction date is saledate, then listing date and then date scraped (if a listing expired)
     trans_date = ifelse(!is.na(saledate), saledate, 
                         ifelse(!is.na(listing_date) & !listing_status %in% "Listing expired", listing_date,
@@ -25,7 +25,8 @@ clean_listings <- function (listings){
     ),
     status_clean = factor(status_clean, levels=c("Sold","For Sale","Sale Expired","Rented","To Rent","Rent Expired","Rent NA")),
     price_num = str_replace_all(price,"[£,]","") %>% str_extract("\\d+") %>% as.numeric,
-    new_home = str_detect(listing_url,"new-home") & !is.na(listing_url)
+    new_home = str_detect(listing_url,"new-home") & !is.na(listing_url),
+    address = ifelse(is.na(streetAddress),address, streetAddress)
   ) %>% 
     return
 
@@ -84,6 +85,8 @@ create_property_info <- function(clist) {
     ) %>% select(-latitude_ps, -longitude_ps) %>% ungroup %>% arrange(
       desc(as.numeric(as.character(listing_key)))
     )
+  
+  property_info_full$listing_key[is.na(property_info_full$listing_key)] <- paste0("p",property_info_full$property_key)[is.na(property_info_full$listing_key)]
   
   return(property_info_full)
   
