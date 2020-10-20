@@ -74,7 +74,7 @@ bar_df <- plotdf %>% mutate(post_first = str_extract(postalCode, "[A-Z]+\\d+")) 
 p <- ggplot(bar_df, aes(beds, n)) + geom_col(fill="white", colour="black", alpha=0.3) + theme_minimal() + 
   ggtitle("Number of properties by bedrooms") +
   geom_text(aes(label=scales::comma(n,accuracy = 1)), vjust=1.3) +
-  theme(axis.text.y = element_blank()) + scale_y_continuous("") + facet_wrap("post_first")
+  theme(axis.text.y = element_blank(), panel.grid.minor.x = element_blank(), strip.text = element_text(size=12)) + scale_y_continuous("") + facet_wrap("post_first")
 ggsave("property-beds.png",p, height=8, width=12)
 p
 ```

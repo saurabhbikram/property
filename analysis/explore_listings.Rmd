@@ -31,22 +31,8 @@ Lets look at all the different types of listings we have, denoted by listing sta
 
 A listing status are 'tags' on the listing page. They tell us if a property has been sold/let. Alternatively we also get status updates from the property page. For e.g `Listedforsale` means that a property was historically listed and `Sold` means a property was sold according to land registry.
 
-```{r}
-to_markdown <- function(df) {
-columns = names(df) %>% paste0(collapse="|")
-breaker = rep("---", ncol(df)) %>% paste0(collapse="|")
-rows = apply(df,1, function(x) paste(x, collapse="|")) %>% sprintf("|%s|",.) %>% paste0(collapse="\n")
-txt <- glue("
-     |{columns}|
-     |{breaker}|
-     {rows}
-     ")
-return(txt)
-}
-```
-
-
 ```{r results=asis}
+source('vis_func.R') # imports useful functions like 1) to_markdown
 table(listings$status %>% tolower) %>% sort %>% rev %>% data.frame() %>% to_markdown
 ```
 
@@ -75,55 +61,8 @@ Surprised to see price increases! Although they are 4x less common than a price 
 First of all we create a `clean_status` which ignores some statues and groups certain statuses. The code should explain what I am doing.
 
 ```{r}
-prices_data_sum <- listings %>% 
-  # keep only residential listings
-  filter(is.na(listing_url) | (!str_detect(listing_url,"commercial"))  ) %>% 
-  
-  mutate(
-    # this is the information in the table that comes up on the website, for a listing
-    # it sometimes tell us previous listings of the property
-    info_type = ifelse(str_detect(info_type, "Price reduced"),"Price reduction",info_type),
-    info_type = ifelse(str_detect(info_type, "Price increased"),"Price increase",info_type),
-    # create factors, keeping the more importat levels first, since we will use this as the order to 
-    # de-duplicate
-    info_type = factor(str_replace_all(str_trim(info_type)," ","_") %>% tolower, 
-                       levels = c("price_reduction","price_increase","first_listed","last_sold","main_listing","previous_sale_prices")),
-    status_clean = case_when(
-      str_detect(tolower(status),"sold") ~ "Sold", # put under offer same as sold for reducing number of cats
-      info_type=="last_sold" ~ "Sold",
-      str_detect(tolower(status),"under offer") ~ "For Sale", # put under offer same as sold for reducing number of cats
-      str_detect(tolower(status),"let") ~ "Rented",
-      str_detect(tolower(status),"listedforsale") ~ "For Sale", # this is the 'archived' info on website, displaying when something was listed for sale historically
-      str_detect(listing_url,"to-rent") & status == "Listing expired" ~ "Rent Expired",
-      str_detect(listing_url,"for-sale") & status == "Listing expired" ~ "Sale Expired",
-      str_detect(listing_url,"to-rent") ~ "To Rent",
-      str_detect(listing_url,"for-sale") ~ "For Sale",
-      str_detect(price,"pcm") ~ "Rent NA", # price in pcm but no other status info..
-      str_detect(listing_url,"property-history")  ~ "For Sale" # if not status given, this url is the archived url template, and assume its for sale
-    ),
-    
-    status_clean = factor(status_clean, levels=c("Sold","For Sale","Rented","To Rent","Rent NA","Rent Expired","Sale Expired")),
-    
-    # clean prices
-    price_num = str_replace_all(price,"[£,]","") %>% str_extract("\\d+") %>% as.numeric,
-    
-    # clean dates
-    saledate_date = lubridate::ymd_hms(saledate) %>% as.Date,
-    saledate_date = as.Date(ifelse(is.na(saledate_date),ymd(saledate), saledate_date), origin='1970-01-01'),
-    
-    # get unique id / key for listing.
-    listing_key = ifelse(is.na(listing_id), paste0("p",property_id,year(saledate_date)), paste0("l",listing_id)),
-    listing_key = as.factor((as.character(listing_key))),
-  )
-
-prices_data_sum <- prices_data_sum %>% 
-  # remove missing saledates, approx 20% of the data is lost here because these are properties which have
-  # never been sold
-  filter(saledate != "None" & !is.na(saledate_date) & !is.na(price_num)) %>% 
-  left_join(properties %>% select(area, beds, property_id, zest, postalCode), by="property_id") %>% 
-  select(-saledate,-price,-listing_url) %>% arrange(saledate_date)
-
-print("Summary")
+source('clean_listings.R')
+prices_data_sum <- clean_listings(listings, properties)
 summary(prices_data_sum %>% select(saledate_date, status_clean, price_num, info_type))
 ```
 
@@ -376,3 +315,4 @@ p4 <- ggplot(prdf %>% mutate(beds=factor(beds, levels=c("studio/1","2","3"))) , 
   theme(legend.position = "none", strip.text = element_text(size=11)) + ggtitle("Smaller properties provide higher rental yield", subtitle = "by bedrooms")
 ggsave(glue("graphics/rental_yield_area_cor.svg"),p4, height = 5, width=7)
 ```
+
