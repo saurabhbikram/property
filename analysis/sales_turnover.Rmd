@@ -1,0 +1,111 @@
+---
+title: "LondonSalesTurnover"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(DBI)
+library(lubridate)
+```
+
+```{r}
+get_creds <- function() {
+  jstring <-
+    system(
+      "aws secretsmanager get-secret-value --secret-id prod/db1/app --region us-east-1 --output json",
+      intern = T
+    )
+  res <-
+    jsonlite::fromJSON(jsonlite::fromJSON(paste0(jstring, collapse = ""))$SecretString)
+  return(res)
+}
+get_con <- function(res) {
+  con <-
+    RPostgres::dbConnect(
+      RPostgres::Postgres(),
+      user = res$username,
+      password = res$password,
+      host = res$host,
+      dbname = "propertydata",
+      bigint = "numeric"
+    )
+  return(con)
+}
+
+#con <- get_con(get_creds())
+#all_lisings <- tbl(con,"proc_listings") %>% collect()
+```
+
+```{r}
+#saveRDS(all_lisings, "allistings.rds")
+```
+
+```{r}
+#system("aws s3 cp allistings.rds s3://ukpd/property-analysis/alllistings.rds")
+```
+
+
+```{r}
+w <- is.na(all_lisings$saledate)
+all_lisings$saledate2 <- all_lisings$saledate
+all_lisings$saledate2[w] <- all_lisings$listing_date[w]
+w <- is.na(all_lisings$saledate2) & all_lisings$listing_status!="Last sold"
+w[is.na(w)] <- FALSE
+all_lisings$saledate2[w] <- all_lisings$date_scraped[w]
+summary(all_lisings$saledate2)
+```
+
+
+```{r}
+sales <- filter(all_lisings, str_detect(tolower(listing_status), "sold"))
+```
+
+```{r}
+summary(sales[is.na(sales$saledate),c('date_scraped','listing_date','saledate')])
+```
+
+```{r}
+
+```
+
+```{r}
+sales2 <- filter(arrange(sales, desc(saledate)), !duplicated(listing_url) & !is.na(saledate2))
+```
+
+
+```{r}
+sales2$sale_year <- sales2$saledate2 %>% year %>% as.factor
+summary(sales2$sale_year)
+```
+```{r}
+ec1 <- filter(sales2, str_detect(tolower(postcode), "^ec") & sale_year == 2021)
+ec1$property_id
+```
+
+```{r}
+sale_statuses <- c("Sold subject to contract","Sold STC","Last sold")
+```
+
+```{r}
+aa <- filter(all_lisings, property_id==31080950) %>% 
+  distinct(saledate2, listing_status, price_num) %>% 
+  mutate(sale=listing_status %in% sale_statuses) %>% arrange(desc(saledate2))
+aa
+```
+```{r}
+ab <- aa[aa$sale,]
+ab
+```
+
+
+```{r}
+ac <- aa[between(aa$saledate2, ab$saledate2[2], ab$saledate2[1]) & !aa$sale,]
+
+min_price <- min(ac$price_num)
+max_price <- max(ac$price_num)
+time_to_sell <- difftime(ab$saledate2[1], min(ac$saledate2, na.rm=T), units = "days")
+time_to_sell
+```
+
