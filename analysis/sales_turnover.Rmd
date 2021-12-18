@@ -54,7 +54,13 @@ all_lisings$saledate2[w] <- all_lisings$listing_date[w]
 w <- is.na(all_lisings$saledate2) & all_lisings$listing_status!="Last sold"
 w[is.na(w)] <- FALSE
 all_lisings$saledate2[w] <- all_lisings$date_scraped[w]
-summary(all_lisings$saledate2)
+
+w <- is.na(all_lisings$trans_date) & all_lisings$listing_status!="Last sold"
+w[is.na(w)] <- FALSE
+all_lisings$saledate2[w] <- all_lisings$date_scraped[w]
+
+
+all_lisings$listing_status[!is.na(all_lisings$lang_reg_id)] <- "Sold (LR)"
 ```
 
 
@@ -63,35 +69,54 @@ sales <- filter(all_lisings, str_detect(tolower(listing_status), "sold"))
 ```
 
 ```{r}
-summary(sales[is.na(sales$saledate),c('date_scraped','listing_date','saledate')])
+summary(sales[is.na(sales$saledate),c('date_scraped','listing_date','saledate','trans_date')])
 ```
-
 ```{r}
-
-```
-
-```{r}
-sales2 <- filter(arrange(sales, desc(saledate)), !duplicated(listing_url) & !is.na(saledate2))
+sales2 <- filter(arrange(sales, desc(trans_date)), 
+                 !duplicated(listing_key) & !is.na(trans_date))
 ```
 
 
 ```{r}
-sales2$sale_year <- sales2$saledate2 %>% year %>% as.factor
+sales2$sale_year <- sales2$trans_date %>% year %>% as.factor
 summary(sales2$sale_year)
 ```
 ```{r}
-ec1 <- filter(sales2, str_detect(tolower(postcode), "^ec") & sale_year == 2021)
-ec1$property_id
+savelist <- aws.s3::s3readRDS("preprocess/diff/EC.rds",bucket="ukpd")
 ```
 
 ```{r}
-sale_statuses <- c("Sold subject to contract","Sold STC","Last sold")
+library(glue)
+```
+
+
+```{r}
+ec1 <- filter(sales2, str_detect(tolower(postcode), "^ec") & sale_year == 2021 & beds==1)
+ec1 %>% select(property_key, address, postcode, trans_date, price_num) %>% arrange(desc(trans_date)) %>% 
+  arrange(price_num)
 ```
 
 ```{r}
-aa <- filter(all_lisings, property_id==31080950) %>% 
-  distinct(saledate2, listing_status, price_num) %>% 
-  mutate(sale=listing_status %in% sale_statuses) %>% arrange(desc(saledate2))
+filter(all_lisings, postcode=="EC1M 6ET" & 
+         trans_date > '2020-01-01' & 
+         (!str_detect(price, "pcm") | is.na(price)) &
+         (price_num > 10e3 | is.na(price_num))
+       ) %>% 
+  arrange(desc(trans_date)) %>% 
+  select(trans_date, property_key, listing_key, address, price, price_num, listing_status, area, beds) %>% distinct()
+```
+
+
+```{r}
+sale_statuses <- c("Sold subject to contract","Sold STC","Last sold", "Sold (LR)")
+```
+
+```{r}
+aa <- filter(all_lisings, property_key=="7956474" & (!str_detect(price,"pcm") | is.na(price)) & 
+               (price_num > 10e3 | is.na(price_num))) %>% 
+  distinct(trans_date, listing_status, price, price_num, area, beds) %>% 
+  mutate(sale=listing_status %in% sale_statuses) %>% 
+  arrange(desc(trans_date))
 aa
 ```
 ```{r}
@@ -101,11 +126,12 @@ ab
 
 
 ```{r}
-ac <- aa[between(aa$saledate2, ab$saledate2[2], ab$saledate2[1]) & !aa$sale,]
+if(nrow(ab) > 1) ac <- aa[between(aa$trans_date, ab$trans_date[2], ab$trans_date[1]) & !aa$sale,] else 
+  ac <- aa[(aa$trans_date < ab$trans_date[1]) & !aa$sale,] 
 
 min_price <- min(ac$price_num)
 max_price <- max(ac$price_num)
-time_to_sell <- difftime(ab$saledate2[1], min(ac$saledate2, na.rm=T), units = "days")
+time_to_sell <- difftime(ab$trans_date[1], min(ac$trans_date, na.rm=T), units = "days")
 time_to_sell
 ```
 
