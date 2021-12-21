@@ -4,7 +4,7 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, fig.height = 6, fig.width = 10)
 library(tidyverse)
 library(DBI)
 library(lubridate)
@@ -43,95 +43,285 @@ get_con <- function(res) {
 ```
 
 ```{r}
-#system("aws s3 cp allistings.rds s3://ukpd/property-analysis/alllistings.rds")
+#system("aws s3 cp allistings.rds s3://ukpd/property-analysis/alllistings.rds --profile sb")
+#system("aws s3 cp s3://ukpd/property-analysis/alllistings.rds . --profile sb")
+```
+
+```{r}
+all_lisings <- readRDS("alllistings.rds")
 ```
 
 
 ```{r}
-w <- is.na(all_lisings$saledate)
-all_lisings$saledate2 <- all_lisings$saledate
-all_lisings$saledate2[w] <- all_lisings$listing_date[w]
-w <- is.na(all_lisings$saledate2) & all_lisings$listing_status!="Last sold"
-w[is.na(w)] <- FALSE
-all_lisings$saledate2[w] <- all_lisings$date_scraped[w]
-
-w <- is.na(all_lisings$trans_date) & all_lisings$listing_status!="Last sold"
-w[is.na(w)] <- FALSE
-all_lisings$saledate2[w] <- all_lisings$date_scraped[w]
-
-
 all_lisings$listing_status[!is.na(all_lisings$lang_reg_id)] <- "Sold (LR)"
 ```
 
 
 ```{r}
-sales <- filter(all_lisings, str_detect(tolower(listing_status), "sold"))
+rawsales <- filter(all_lisings, str_detect(tolower(listing_status), "sold")) %>% 
+  mutate(
+    source=ifelse(is.na(source),"Zoopla",source) %>% factor(levels=c("LandRegistry","Zoopla")),
+    sale_year =year(trans_date),
+    incode=str_extract(postcode,"[A-Z]+"),
+  ) %>% 
+  arrange(source, desc(trans_date)) %>% 
+  filter(!is.na(trans_date)) %>% 
+  group_by(property_key) %>% 
+  mutate(lag_sale=lag(trans_date), 
+             time_diff=difftime(lag_sale, trans_date, units="days")
+             ) %>% 
+  filter(is.na(time_diff)|time_diff>250) %>% 
+  ungroup
+
 ```
 
 ```{r}
-summary(sales[is.na(sales$saledate),c('date_scraped','listing_date','saledate','trans_date')])
-```
-```{r}
-sales2 <- filter(arrange(sales, desc(trans_date)), 
-                 !duplicated(listing_key) & !is.na(trans_date))
+rsales <- filter(rawsales, sale_year >= 2020)
+length(str_subset(rsales$property_key,"land_reg",negate = T))
 ```
 
+```{r cache=TRUE, cache.extra=Sys.Date()}
+alist_all <- list()
+for(x in rsales$property_key) {
+  
+  a <- filter(rawsales, property_key %in% x) %>% 
+    arrange(desc(trans_date)) %>% 
+    select(property_key, listing_key, trans_date,listing_date,date_scraped, listing_status, price, price_num)
+  
+  aa <- filter(all_lisings, property_key==x & 
+                 (!str_detect(price,"pcm") | is.na(price)) & 
+                 (price_num > 10e3 | is.na(price_num)) &
+                 listing_status != "Listing expired" &
+                 !str_detect(tolower(listing_status),"sold")
+               ) %>% 
+    distinct(property_key, listing_key, trans_date,listing_date,date_scraped, listing_status, price, price_num, area, beds) %>% 
+    bind_rows(a) %>% arrange(desc(trans_date))
+  
+  if(nrow(aa)<=1) next()
+  
+  if(nrow(a) > 1) aa <- filter(aa, trans_date > a$trans_date[2])
+  
+  if(nrow(aa)<=1) next()
+  
+  alist <- a[1,] %>% as.list()
+  alist$min_price <- min(aa$price_num,na.rm = T)
+  alist$max_price <- max(aa$price_num,na.rm = T)
+  
+  listing_dates <- aa %>% select(date_scraped,listing_date,trans_date) %>% unlist
+  
+  alist$listed_date <- min(listing_dates,na.rm = T) %>% as.Date(origin="1970-01-01")
+  w <- tolower(aa$listing_status) %in% tolower(c("First listed","Listedforsale"))
+  if(any(w)) {
+    alist$listed_date <- min(aa$listing_date[w])
+    if(is.na(alist$listed_date)) alist$listed_date <- aa$trans_date[w][1]
+  }
+  
+  # default sale time is the last date seen scraped/listed
+  alist$sale_time <- max(c(listing_dates, a$trans_date[1]),na.rm = T) %>% as.Date(origin="1970-01-01")  
+  
+  # unless we see a sold listing status and the trans date of this sold date
+  # is different to listing date
+  w <- aa$listing_status %in% c("Sold subject to contract","Sold", "Sold STC")
+  if(any(w)) {
+    trans_date <- min(aa$trans_date[w])
+    if(trans_date != alist$listed_date) alist$sale_time <- trans_date
+  }
+  
+  alist
+  alist_all <- c(alist_all, list(alist))
+  
+}
+```
 
 ```{r}
-sales2$sale_year <- sales2$trans_date %>% year %>% as.factor
-summary(sales2$sale_year)
+about_sale <- bind_rows(alist_all) %>% 
+  mutate(
+    use_sale_time = ifelse(str_detect(listing_key,"land_reg"),trans_date, sale_time) %>% as.Date(origin="1970-01-01"),
+    time_to_sell = difftime(use_sale_time,listed_date,units="days") %>% as.numeric,
+    avg_price_reduction = price_num/max_price,
+    avg_price_reduction = ifelse(is.infinite(avg_price_reduction) | avg_price_reduction < 0.5, NA, avg_price_reduction)
+  ) %>% left_join(
+  rawsales %>% select(listing_key, beds, area) %>% distinct(),by="listing_key"
+) 
+
+```
+
+```{r}
+about_sale %>% 
+  arrange(desc(time_to_sell)) %>% 
+  select(listing_key, property_key,use_sale_time, listed_date, time_to_sell)
 ```
 ```{r}
-savelist <- aws.s3::s3readRDS("preprocess/diff/EC.rds",bucket="ukpd")
-```
-
-```{r}
-library(glue)
+summary(about_sale$time_to_sell)
 ```
 
 
 ```{r}
-ec1 <- filter(sales2, str_detect(tolower(postcode), "^ec") & sale_year == 2021 & beds==1)
-ec1 %>% select(property_key, address, postcode, trans_date, price_num) %>% arrange(desc(trans_date)) %>% 
-  arrange(price_num)
-```
-
-```{r}
-filter(all_lisings, postcode=="EC1M 6ET" & 
-         trans_date > '2020-01-01' & 
-         (!str_detect(price, "pcm") | is.na(price)) &
-         (price_num > 10e3 | is.na(price_num))
-       ) %>% 
-  arrange(desc(trans_date)) %>% 
-  select(trans_date, property_key, listing_key, address, price, price_num, listing_status, area, beds) %>% distinct()
+sales <- rawsales %>% 
+  left_join(
+    about_sale %>% select(listing_key, use_sale_time) %>% distinct(),
+    by="listing_key"
+  ) %>% 
+  mutate(
+    trans_date = ifelse(!is.na(use_sale_time),use_sale_time, trans_date) %>% as.Date("1970-01-01")
+  ) %>% select(-use_sale_time)
 ```
 
 
-```{r}
-sale_statuses <- c("Sold subject to contract","Sold STC","Last sold", "Sold (LR)")
-```
 
 ```{r}
-aa <- filter(all_lisings, property_key=="7956474" & (!str_detect(price,"pcm") | is.na(price)) & 
-               (price_num > 10e3 | is.na(price_num))) %>% 
-  distinct(trans_date, listing_status, price, price_num, area, beds) %>% 
-  mutate(sale=listing_status %in% sale_statuses) %>% 
-  arrange(desc(trans_date))
-aa
-```
-```{r}
-ab <- aa[aa$sale,]
-ab
+all_lisings %>% filter(property_key==27201023) %>% 
+  select(listing_status, listing_key, listing_date, date_scraped, trans_date, price_num) %>% arrange(desc(trans_date))
 ```
 
 
-```{r}
-if(nrow(ab) > 1) ac <- aa[between(aa$trans_date, ab$trans_date[2], ab$trans_date[1]) & !aa$sale,] else 
-  ac <- aa[(aa$trans_date < ab$trans_date[1]) & !aa$sale,] 
 
-min_price <- min(ac$price_num)
-max_price <- max(ac$price_num)
-time_to_sell <- difftime(ab$trans_date[1], min(ac$trans_date, na.rm=T), units = "days")
-time_to_sell
+```{r}
+sumdf <- sales  %>% group_by(sale_year, incode) %>% 
+  summarise(n=n(), 
+            median_price=median(price_num),
+            mean_price=mean(price_num)
+            ) %>% 
+  arrange(desc(sale_year))  %>% ungroup() %>% filter(sale_year > 2000)
+
+sumdf
+```
+
+```{r}
+sumdf %>% filter(sale_year %in% c(2019, 2020,2021))
+```
+
+
+```{r}
+ggplot(sumdf, aes(sale_year, n, fill=incode)) + geom_col(aes(alpha=ifelse(sale_year %in% c(2020,2019),0.9,0.7))) +
+  ggtitle("Number of sales per year in Central London") +
+  theme_minimal() +
+  theme(#axis.text.x = element_text(angle=90), 
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  scale_x_continuous("", breaks=scales::pretty_breaks(n=10)) +
+  scale_fill_brewer("Postcode",type="qual", palette = "Set2") +
+  scale_y_continuous("Number of sales") +
+  scale_alpha_continuous(guide='none')
+```
+
+```{r}
+ggplot(sumdf %>% filter(sale_year < 2021), aes(sale_year, median_price)) + 
+  geom_point() +
+  geom_smooth(se=F, size=1) +
+  facet_wrap("incode",ncol=2) +
+  scale_y_continuous("median price", 
+                labels=function(x)scales::comma(x,prefix="£"), 
+                breaks=scales::pretty_breaks(n=5)) +
+  ggtitle("Median sold prices per year in Central London") + scale_x_continuous("", labels=round)
+```
+```{r}
+ggplot(sumdf %>% filter(sale_year < 2021), aes(sale_year, mean_price)) + 
+  geom_point() +
+  geom_smooth(se=F, size=1) +
+  facet_wrap("incode",ncol=2) +
+  scale_y_continuous("mean price", 
+                labels=function(x)scales::comma(x,prefix="£"), 
+                breaks=scales::pretty_breaks(n=5)) +
+  ggtitle("Mean sold prices per year in Central London") + scale_x_continuous("", labels=round)
+```
+
+```{r}
+total_beds <- filter(all_lisings, property_key %in% sales$property_key) %>% 
+  group_by(property_key) %>% 
+  summarise(
+    beds=round(mean(beds,na.rm=T))
+  )
+sales <- left_join(sales %>% select(-beds), total_beds, by="property_key")
+```
+
+
+
+```{r}
+sumdf <- sales %>% 
+  group_by(sale_year, incode, beds=as.factor(ifelse(beds >= 3, "3+", as.character(beds)))) %>% 
+  summarise(n=n(), 
+            median_price=median(price_num,na.rm=T),
+            mean_price=mean(price_num,na.rm=T)
+            ) %>% 
+  #filter(!is.na(beds)) %>% 
+  arrange(desc(sale_year))  %>% ungroup() %>% filter(sale_year > 2000)
+
+```
+```{r}
+source("vis_func.R")
+```
+
+```{r}
+sumdf %>% filter(incode=="EC", sale_year==2019)
+```
+
+```{r}
+sumdf %>% filter(incode=="EC", sale_year==2020)
+```
+
+
+```{r}
+ec2019 <- sumdf %>% filter(incode=="EC", sale_year==2019) %>% select(median_price, mean_price)
+ec2020 <- sumdf %>% filter(incode=="EC", sale_year==2020) %>% select(median_price, mean_price)
+sumdf %>% filter(incode=="EC", sale_year==2019) %>% select(beds) %>% cbind(100*round(ec2020/ec2019 - 1,3)) %>% 
+  to_markdown()
+```
+
+```{r}
+sumdf %>% filter(incode=="WC", sale_year==2019)
+```
+
+```{r}
+sumdf %>% filter(incode=="WC", sale_year==2020)
+```
+
+
+```{r}
+ec2019 <- sumdf %>% filter(incode=="WC", sale_year==2019) %>% select(median_price, mean_price)
+ec2020 <- sumdf %>% filter(incode=="WC", sale_year==2020) %>% select(median_price, mean_price)
+sumdf %>% filter(incode=="WC", sale_year==2019) %>% select(beds) %>% cbind(100*round(ec2020/ec2019 - 1,3)) %>% 
+  to_markdown()
+```
+
+```{r}
+mean(about_sale$avg_price_reduction<0.99,na.rm = T)
+```
+
+```{r}
+about_sale %>% 
+  mutate(
+    beds=as.factor(ifelse(beds >= 3, "3+", as.character(beds)))
+  ) %>% 
+  group_by(beds) %>% 
+  summarise(
+    n=n(),
+    median_price_reduction=(median(avg_price_reduction,na.rm=T)-1) %>% scales::percent(),
+    median_time_to_sell=(median(time_to_sell,na.rm=T)/30.4) %>% round(1),
+    prop_reduced=mean(avg_price_reduction<0.99,na.rm=T) %>% scales::percent(),
+    prop_reduced_15=mean(avg_price_reduction<0.85,na.rm=T) %>% scales::percent(),
+    prop_longer_9m_sell=mean(time_to_sell>270) %>% scales::percent()
+  ) %>% filter(!is.na(beds)) %>% 
+  to_markdown()
+```
+
+
+```{r}
+plotdf <- about_sale %>% 
+         filter(
+           avg_price_reduction<1,
+           time_to_sell > 10,
+           #!(avg_price_reduction>0.95 & time_to_sell>365)
+           ) %>% 
+  mutate(
+    beds=as.factor(ifelse(beds >= 3, "3+", as.character(beds)))
+  )
+ggplot(plotdf, 
+       aes(time_to_sell/30, avg_price_reduction-1)) + geom_point(alpha=0.3) + 
+  stat_smooth(method = "loess",method.args = list(family="symmetric")) +
+  scale_y_continuous("Total reduction in price (highest price vs sold price)",
+                     limits=c(-0.3,0), labels=scales::percent) +
+  scale_x_continuous("months to sell",limits=c(0,24)) +
+  ggtitle("Price reductions on EC & WC homes", subtitle = glue("from {nrow(plotdf)} price reduced sales made in the year {year(min(plotdf$sale_time))} and after"))
 ```
 
